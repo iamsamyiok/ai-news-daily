@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI 日报 · 每日 AI 新闻聚合</title>
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+tailwind.config = { theme: { extend: { colors: { ink: '#0a0a0f', card: '#14141c', accent: '#6366f1' } } } }
+</script>
+<style>
+  body { background: radial-gradient(1200px 600px at 70% -10%, rgba(99,102,241,.12), transparent), #0a0a0f; }
+  .score-ring { font-variant-numeric: tabular-nums; }
+  .fade-in { animation: fade .5s ease both; }
+  @keyframes fade { from { opacity: 0; transform: translateY(8px);} to { opacity: 1; transform: none;} }
+</style>
+</head>
+<body class="text-gray-100 min-h-screen antialiased">
+  <header class="max-w-3xl mx-auto px-4 pt-12 pb-6">
+    <div class="flex items-center justify-between flex-wrap gap-3">
+      <div>
+        <h1 class="text-3xl sm:text-4xl font-bold tracking-tight">
+          AI <span class="text-accent">日报</span>
+        </h1>
+        <p class="text-gray-400 mt-2 text-sm sm:text-base">每天早 8 点自动聚合昨日 AI 要闻 · 按重要性排序</p>
+      </div>
+      <span id="date-badge" class="text-xs sm:text-sm bg-card border border-white/10 rounded-full px-4 py-1.5 text-gray-300"></span>
+    </div>
+  </header>
+
+  <main class="max-w-3xl mx-auto px-4 pb-24">
+    <div id="status" class="hidden text-center py-20 text-gray-400"></div>
+    <ol id="list" class="space-y-4"></ol>
+  </main>
+
+  <footer class="max-w-3xl mx-auto px-4 pb-10 text-center text-xs text-gray-600">
+    Powered by Tavily + Agnes LLM · 数据写入 Supabase · GitHub Actions 每日 08:00 (UTC+8) 自动更新
+  </footer>
+
+<script>
+const SUPABASE_URL = window.SUPABASE_URL || '';
+const SUPABASE_ANON_KEY = window.SUPABASE_ANON_KEY || '';
+const REST = SUPABASE_URL.replace(/\/$/, '') + '/rest/v1/news_items';
+
+function scoreColor(s) {
+  if (s >= 9) return 'text-red-400 border-red-400/40 bg-red-400/10';
+  if (s >= 7) return 'text-orange-300 border-orange-300/40 bg-orange-300/10';
+  if (s >= 5) return 'text-yellow-200 border-yellow-200/40 bg-yellow-200/10';
+  return 'text-gray-400 border-gray-500/40 bg-gray-500/10';
+}
+function showStatus(msg) {
+  const el = document.getElementById('status');
+  el.textContent = msg; el.classList.remove('hidden');
+}
+
+async function load() {
+  // 注入配置（config.js 可选，不存在则用占位提示）
+  document.getElementById('date-badge').textContent =
+    new Date().toLocaleDateString('zh-CN', { year:'numeric', month:'long', day:'numeric', weekday:'long' });
+
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) { showStatus('⚠️ 未配置 SUPABASE_URL / SUPABASE_ANON_KEY（config.js）'); return; }
+
+  const today = new Date(Date.now() + (8 * 3600 * 1000)).toISOString().slice(0, 10); // 北京时间今天
+  const url = REST
+    + '?select=title,title_en,url,summary_zh,score,source,lang,published_date'
+    + '&published_date=lte.' + today
+    + '&order=published_date.desc,score.desc.nullslast'
+    + '&limit=30';
+
+  try {
+    const res = await fetch(url, { headers: { apikey: SUPABASE_ANON_KEY, Authorization: 'Bearer ' + SUPABASE_ANON_KEY } });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const items = await res.json();
+    if (!items.length) { showStatus('今天还没有数据 · 流水线每天 08:00（北京时间）运行，请稍后再来'); return; }
+
+    const listEl = document.getElementById('list');
+    items.forEach((it, i) => {
+      const li = document.createElement('li');
+      li.className = 'fade-in';
+      li.style.animationDelay = (i * 40) + 'ms';
+      li.innerHTML =
+        '<a href="' + it.url + '" target="_blank" rel="noopener" '
+        + 'class="block bg-card border border-white/10 hover:border-accent/60 transition rounded-2xl p-5 sm:p-6">'
+        + '<div class="flex items-start gap-4">'
+          + '<div class="score-ring shrink-0 w-12 h-12 rounded-xl border flex flex-col items-center justify-center ' + scoreColor(it.score) + '">'
+            + '<span class="text-lg font-bold leading-none">' + it.score + '</span>'
+            + '<span class="text-[9px] opacity-60 mt-0.5">SCORE</span>'
+          + '</div>'
+          + '<div class="min-w-0">'
+            + '<h2 class="font-semibold text-base sm:text-lg leading-snug group-hover:text-white">' + esc(it.title) + '</h2>'
+            + '<p class="text-gray-400 text-sm mt-2 leading-relaxed">' + esc(it.summary_zh) + '</p>'
+            + '<div class="flex items-center gap-2 mt-3 text-xs text-gray-500 flex-wrap">'
+              + '<span class="bg-white/5 rounded-md px-2 py-0.5">' + esc(it.source || '') + '</span>'
+              + (it.lang === 'zh' ? '<span class="bg-white/5 rounded-md px-2 py-0.5">中文</span>' : '')
+              + '<span class="ml-auto">' + (it.published_date || '') + '</span>'
+            + '</div>'
+          + '</div>'
+        + '</div></a>';
+      listEl.appendChild(li);
+    });
+  } catch (e) {
+    showStatus('加载失败：' + e.message + '（检查 RLS 是否已开启、anon key 是否正确）');
+  }
+}
+function esc(s) { const d = document.createElement('div'); d.textContent = s || ''; return d.innerHTML; }
+load();
+</script>
+</body>
+</html>
