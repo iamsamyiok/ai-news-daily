@@ -1,0 +1,11 @@
+
+# debug artifacts from browser-based debugging sessions
+vb*.json
+vd*.json
+vdoc.html
+vprod2.json
+vproj.json
+vteam*.json
+vteams.json
+vuser.json
+vercel_*.png

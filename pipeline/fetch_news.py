@@ -40,6 +40,63 @@ def tavily_search(api_key, query, max_results=15):
     }
     return http_json("https://api.tavily.com/search", body).get("results", [])
 
+def http_get(url, timeout=40):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (compatible; ai-news-daily/1.0)"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", errors="replace")
+
+def fetch_tldr_ai(max_items=25):
+    """TLDR AI 日报 RSS（海外直连可用）：https://tldr.tech/api/rss/ai"""
+    try:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(http_get("https://tldr.tech/api/rss/ai"))
+        items = []
+        for item in root.iter("item"):
+            def tag_text(tag):
+                el = item.find(tag)
+                return (el.text or "").strip() if el is not None else ""
+            title, link = tag_text("title"), tag_text("link")
+            if not title or not link:
+                continue
+            items.append({
+                "title": title,
+                "url": link,
+                "content": tag_text("description")[:800],
+                "published": tag_text("pubDate"),
+            })
+        print(f"[rss] TLDR AI -> {len(items)} items")
+        return items[:max_items]
+    except Exception as e:
+        print(f"[rss] TLDR AI failed: {e}")
+        return []
+
+def fetch_hf_daily_papers(max_items=15):
+    """Hugging Face Daily Papers API：按 upvotes 取当日热门论文"""
+    try:
+        data = http_json("https://huggingface.co/api/daily_papers", timeout=40)
+        rows = []
+        for it in data:
+            p = it.get("paper") or {}
+            pid = p.get("id")
+            title = (p.get("title") or "").replace("\n", " ").strip()
+            if not pid or not title:
+                continue
+            rows.append({
+                "title": title,
+                "url": f"https://huggingface.co/papers/{pid}",
+                "content": (p.get("summary") or "").replace("\n", " ").strip()[:800],
+                "published": p.get("publishedAt", ""),
+                "_upvotes": int(p.get("upvotes") or 0),
+            })
+        rows.sort(key=lambda r: -r["_upvotes"])
+        for r in rows:
+            r.pop("_upvotes", None)
+        print(f"[api] HF Daily Papers -> {len(rows)} items")
+        return rows[:max_items]
+    except Exception as e:
+        print(f"[api] HF Daily Papers failed: {e}")
+        return []
+
 def collect_candidates(tavily_key):
     seen, pool = set(), []
     queries = [
@@ -47,6 +104,9 @@ def collect_candidates(tavily_key):
         "AI model release OpenAI Google Anthropic",
         "人工智能 大模型 发布",
         "AI 大模型 最新进展",
+        # 定向源：RSS 被反爬/下线的两个源改走 Tavily 站内定向
+        "site:venturebeat.com AI",
+        "site:jiqizhixin.com 大模型 人工智能",
     ]
     for q in queries:
         try:
@@ -79,6 +139,11 @@ def agnes_chat(base_url, api_key, model, messages, timeout=180):
 
 def select_and_summarize(agnes_base, agnes_key, agnes_model, pool, target=10):
     today = datetime.now(BEIJING).strftime("%Y-%m-%d")
+    # 候选过多时压缩送审规模（每条只留必要字段），避免 LLM 长输出转义出错
+    MAX_LLM_INPUT = 70
+    if len(pool) > MAX_LLM_INPUT:
+        pool = pool[:MAX_LLM_INPUT]
+        print(f"[llm] pool trimmed to {MAX_LLM_INPUT} for selection")
     items = [{"i": i, "title": c["title"], "url": c["url"],
               "snippet": c["content"][:400], "published": c["published"]}
              for i, c in enumerate(pool)]
@@ -95,14 +160,23 @@ def select_and_summarize(agnes_base, agnes_key, agnes_model, pool, target=10):
 
 候选条目：
 {json.dumps(items, ensure_ascii=False)}"""
-    resp = agnes_chat(agnes_base, agnes_key, agnes_model,
-                      [{"role": "user", "content": prompt}])
-    text = resp["choices"][0]["message"]["content"]
-    # 剥掉可能的 ```json 围栏
-    m = re.search(r"\[.*\]", text, re.S)
-    if not m:
-        raise ValueError(f"LLM output has no JSON array: {text[:300]}")
-    return json.loads(m.group(0))
+    last_err = None
+    for attempt in (1, 2):
+        resp = agnes_chat(agnes_base, agnes_key, agnes_model,
+                          [{"role": "user", "content": prompt}])
+        text = resp["choices"][0]["message"]["content"]
+        # 剥掉可能的 ```json 围栏
+        m = re.search(r"\[.*\]", text, re.S)
+        if not m:
+            last_err = ValueError(f"LLM output has no JSON array: {text[:300]}")
+            continue
+        try:
+            return json.loads(m.group(0))
+        except json.JSONDecodeError as e:
+            last_err = e
+            # 重试时强调转义要求
+            prompt += "\n\n注意：上一次输出 JSON 解析失败。所有字符串内的双引号必须写成 \\\"，只输出合法 JSON 数组，不要任何多余文本。"
+    raise last_err
 
 # ---------- 3. Supabase 写入（service_role 绕过 RLS） ----------
 def supabase_upsert(url, service_key, rows):
@@ -128,7 +202,20 @@ def main():
 
     print(f"[run] {datetime.now(BEIJING).strftime('%Y-%m-%d %H:%M')} Beijing")
 
-    pool = collect_candidates(tavily_key)
+    # 新增源先行：TLDR RSS + HF Daily Papers（与 Tavily 候选按 URL 去重合并）
+    pool = []
+    seen = set()
+    for src in (fetch_tldr_ai(), fetch_hf_daily_papers()):
+        for it in src:
+            if it["url"] and it["url"] not in seen:
+                seen.add(it["url"])
+                pool.append(it)
+    print(f"[sources] TLDR+HF -> {len(pool)} items after dedup")
+
+    for it in collect_candidates(tavily_key):
+        if it["url"] not in seen:
+            seen.add(it["url"])
+            pool.append(it)
     print(f"[pool] {len(pool)} unique candidates")
     if not pool:
         print("[warn] no candidates from Tavily; exit 0 (nothing to do)")
